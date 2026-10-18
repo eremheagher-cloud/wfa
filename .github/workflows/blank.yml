@@ -25,13 +25,12 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name "SecurityLayer" -Value 0 -Force
 
-          # Remove an existing firewall rule if present.
-          # A missing rule is not an error.
+          # Remove existing firewall rule if present
           Get-NetFirewallRule -DisplayName "RDP-Tailscale" `
             -ErrorAction SilentlyContinue |
             Remove-NetFirewallRule -ErrorAction Stop
 
-          # Permit RDP only from Tailscale IPv4 addresses.
+          # Restrict RDP to Tailscale IPv4 addresses
           New-NetFirewallRule `
             -DisplayName "RDP-Tailscale" `
             -Direction Inbound `
@@ -41,7 +40,7 @@ jobs:
             -RemoteAddress "100.64.0.0/10" `
             -ErrorAction Stop
 
-          # Restart the Remote Desktop service
+          # Restart RDP service
           Restart-Service -Name TermService -Force
 
       - name: Create RDP User with Secure Password
@@ -59,7 +58,7 @@ jobs:
                          [char[]](91..96) + [char[]](123..126))
           }
 
-          # Generate a random password with all character types
+          # Generate password with uppercase, lowercase, numbers and symbols
           $rawPassword = @()
           $rawPassword += $charSet.Upper | Get-Random -Count 4
           $rawPassword += $charSet.Lower | Get-Random -Count 4
@@ -69,7 +68,7 @@ jobs:
           $password = -join ($rawPassword | Sort-Object { Get-Random })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
-          # Create or update the RDP user
+          # Create or update RDP user
           if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
               Set-LocalUser -Name "RDP" -Password $securePass
           }
@@ -79,14 +78,14 @@ jobs:
                 -AccountNeverExpires
           }
 
-          # Add the account to the required groups
+          # Add user to required groups
           Add-LocalGroupMember -Group "Administrators" -Member "RDP" `
             -ErrorAction SilentlyContinue
 
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" `
             -ErrorAction SilentlyContinue
 
-          # Preserve the generated credentials in the workflow environment
+          # Preserve credentials in workflow environment
           "RDP_CREDS=User: RDP | Password: $password" |
             Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
@@ -99,7 +98,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          # Select installer according to the operating system architecture
+          # Detect runner architecture
           $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
 
           if ($architecture -eq "Arm64") {
@@ -126,6 +125,8 @@ jobs:
               throw "Tailscale installation failed with exit code $($process.ExitCode)"
           }
 
+          Write-Host "Tailscale installation completed."
+
       - name: Establish Tailscale Connection
         shell: pwsh
         env:
@@ -140,41 +141,67 @@ jobs:
           }
 
           if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
-              throw "Configure the TAILSCALE_AUTH_KEY repository secret."
+              throw "TAILSCALE_AUTH_KEY is missing from GitHub Secrets."
           }
 
-          # Connect Tailscale
-          & $tsExe up "--authkey=$env:TAILSCALE_AUTH_KEY" `
-            "--hostname=gh-runner-$env:GITHUB_RUN_ID"
+          Write-Host "Checking Tailscale service..."
+
+          $service = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
+
+          if (-not $service) {
+              throw "Tailscale service was not found."
+          }
+
+          if ($service.Status -ne "Running") {
+              Start-Service -Name Tailscale
+          }
+
+          $service = Get-Service -Name Tailscale
+          $service.WaitForStatus(
+              [System.ServiceProcess.ServiceControllerStatus]::Running,
+              [TimeSpan]::FromSeconds(30)
+          )
+
+          Write-Host "Connecting to Tailscale..."
+
+          # Limit connection time to prevent an indefinite wait
+          & $tsExe up `
+            "--authkey=$env:TAILSCALE_AUTH_KEY" `
+            "--hostname=gh-runner-$env:GITHUB_RUN_ID" `
+            --timeout=45s
 
           if ($LASTEXITCODE -ne 0) {
-              throw "Tailscale failed to connect."
+              throw "Tailscale connection failed. Check the authentication key and logs."
           }
 
-          # Wait for Tailscale to assign an IPv4 address
-          $tsIP = $null
-          $retries = 0
+          Write-Host "Waiting for Tailscale IPv4 address..."
 
-          while (-not $tsIP -and $retries -lt 36) {
+          $tsIP = $null
+
+          for ($i = 0; $i -lt 12; $i++) {
               $result = & $tsExe ip -4
 
               if ($LASTEXITCODE -eq 0 -and $result) {
-                  $tsIP = ($result | Select-Object -First 1).Trim()
+                  $candidate = ($result | Select-Object -First 1).Trim()
+
+                  if ($candidate -match '^100\.\d{1,3}\.\d{1,3}\.\d{1,3}$') {
+                      $tsIP = $candidate
+                      break
+                  }
               }
 
-              if (-not $tsIP) {
-                  Start-Sleep -Seconds 5
-              }
-
-              $retries++
+              Start-Sleep -Seconds 5
           }
 
           if (-not $tsIP) {
-              throw "Tailscale IP not assigned. Exiting."
+              throw "Tailscale did not assign an IPv4 address."
           }
 
           "TAILSCALE_IP=$tsIP" |
             Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host "Tailscale connected successfully."
+          Write-Host "Tailscale IP: $tsIP"
 
       - name: Verify RDP Accessibility
         shell: pwsh
@@ -183,14 +210,14 @@ jobs:
 
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
 
-          # Test connectivity on port 3389
+          # Test TCP connectivity on RDP port
           $testResult = Test-NetConnection `
             -ComputerName $env:TAILSCALE_IP `
             -Port 3389 `
             -WarningAction SilentlyContinue
 
           if (-not $testResult.TcpTestSucceeded) {
-              throw "TCP connection to RDP port 3389 failed"
+              throw "TCP connection to RDP port 3389 failed."
           }
 
           Write-Host "TCP connectivity successful!"
@@ -201,12 +228,10 @@ jobs:
           Write-Host "`n=== RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
           Write-Host "Username: RDP"
-
-          # Display credentials for the current workflow session
-          Write-Host "Password: $env:RDP_CREDS"
+          Write-Host "Credentials are stored in the workflow environment."
           Write-Host "==================`n"
 
-          # Keep runner active until cancelled or timeout
+          # Keep runner active until cancelled or timed out
           while ($true) {
               Write-Host "[$(Get-Date)] RDP Active"
               Start-Sleep -Seconds 300
